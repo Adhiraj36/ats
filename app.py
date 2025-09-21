@@ -1,278 +1,226 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
-import json
 import io
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-import openai
-from openai import OpenAI
-
-# File processing libraries
 import PyPDF2
-from docx import Document as DocxDocument
 import docx2txt
-
-# ML and similarity libraries
+from datetime import datetime
+from typing import List, Dict, Optional
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import word_tokenize
+from openai import OpenAI
 
-# Download required NLTK data (run once)
+# Download necessary NLTK data if not already
 try:
     nltk.download('punkt', quiet=True)
     nltk.download('stopwords', quiet=True)
 except:
     pass
 
-# Configuration
-st.set_page_config(
-    page_title="Resume Relevance Check System",
-    page_icon="📄",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Initialize OpenAI client (you need to set your API key)
+# Initialize OpenAI client
 @st.cache_resource
 def init_openai_client():
-    """Initialize OpenAI client with API key from secrets or environment"""
-    try:
-        # Try to get API key from Streamlit secrets
-        api_key = st.secrets.get("OPENAI_API_KEY", None)
-        if not api_key:
-            # Fallback to environment variable or user input
-            import os
-            api_key = os.getenv("OPENAI_API_KEY")
-
-        if api_key:
-            return OpenAI(api_key=api_key)
-        else:
-            st.error("OpenAI API key not found. Please set it in secrets.toml or environment variables.")
-            return None
-    except Exception as e:
-        st.error(f"Error initializing OpenAI client: {str(e)}")
+    import os
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        st.error("OpenAI API key not found! Please set OPENAI_API_KEY in secrets or environment.")
         return None
+    return OpenAI(api_key=api_key)
 
-# Text extraction functions
+# Extract text from PDF
 def extract_text_from_pdf(uploaded_file) -> str:
-    """Extract text from PDF file"""
     try:
         pdf_reader = PyPDF2.PdfReader(uploaded_file)
         text = ""
         for page in pdf_reader.pages:
-            text += page.extract_text() + "\n"
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
         return text.strip()
     except Exception as e:
         st.error(f"Error extracting text from PDF: {str(e)}")
         return ""
 
+# Extract text from DOCX
 def extract_text_from_docx(uploaded_file) -> str:
-    """Extract text from DOCX file"""
     try:
-        # Save uploaded file to temporary location and extract text
-        text = docx2txt.process(uploaded_file)
-        return text.strip()
+        return docx2txt.process(uploaded_file).strip()
     except Exception as e:
         st.error(f"Error extracting text from DOCX: {str(e)}")
         return ""
 
+# Extract text from file based on type
 def extract_text_from_file(uploaded_file) -> str:
-    """Extract text from uploaded file based on file type"""
     if uploaded_file is None:
         return ""
-
-    file_extension = uploaded_file.name.lower().split('.')[-1]
-
-    if file_extension == 'pdf':
+    fname = uploaded_file.name.lower()
+    if fname.endswith(".pdf"):
         return extract_text_from_pdf(uploaded_file)
-    elif file_extension in ['docx', 'doc']:
+    elif fname.endswith(".docx") or fname.endswith(".doc"):
         return extract_text_from_docx(uploaded_file)
     else:
-        st.error(f"Unsupported file type: {file_extension}")
+        st.error(f"Unsupported file type {fname}. Supported: PDF, DOCX")
         return ""
 
-# Text preprocessing functions
+# Preprocess text: lower, remove special chars & extra spaces
 def preprocess_text(text: str) -> str:
-    """Clean and preprocess text"""
-    # Remove extra whitespace and normalize
     text = re.sub(r'\s+', ' ', text)
-    # Remove special characters but keep alphanumeric and spaces
     text = re.sub(r'[^a-zA-Z0-9\s]', ' ', text)
     return text.strip().lower()
 
+# Extract keywords using TFIDF and NLTK stopwords
 def extract_keywords(text: str, top_k: int = 20) -> List[str]:
-    """Extract top keywords from text using TF-IDF"""
     try:
-        # Preprocess text
-        cleaned_text = preprocess_text(text)
-
-        # Remove stopwords
+        cleaned = preprocess_text(text)
         stop_words = set(stopwords.words('english'))
-        words = word_tokenize(cleaned_text)
-        filtered_words = [word for word in words if word not in stop_words and len(word) > 2]
-
-        if not filtered_words:
+        words = word_tokenize(cleaned)
+        filtered = [w for w in words if w not in stop_words and len(w) > 2]
+        if not filtered:
             return []
-
-        # Create TF-IDF vectorizer
-        vectorizer = TfidfVectorizer(max_features=top_k, stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform([' '.join(filtered_words)])
-
-        # Get feature names (keywords)
-        feature_names = vectorizer.get_feature_names_out()
-        tfidf_scores = tfidf_matrix.toarray()[0]
-
-        # Get top keywords with scores
-        keyword_scores = list(zip(feature_names, tfidf_scores))
-        keyword_scores.sort(key=lambda x: x[1], reverse=True)
-
-        return [keyword for keyword, score in keyword_scores if score > 0]
+        vec = TfidfVectorizer(max_features=top_k, stop_words='english')
+        tfidf_matrix = vec.fit_transform([' '.join(filtered)])
+        feature_names = vec.get_feature_names_out()
+        scores = tfidf_matrix.toarray()[0]
+        kw_scores = list(zip(feature_names, scores))
+        kw_scores.sort(key=lambda x: x[1], reverse=True)
+        return [k for k, s in kw_scores if s > 0]
     except Exception as e:
-        st.warning(f"Error extracting keywords: {str(e)}")
+        st.warning(f"Keyword extraction failed: {str(e)}")
         return []
 
-# Information extraction functions
-def extract_contact_info(text: str) -> Dict[str, str]:
-    """Extract contact information from text"""
-    contact_info = {}
-
-    # Email extraction
-    email_pattern = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
-    emails = re.findall(email_pattern, text)
-    contact_info['email'] = emails[0] if emails else ""
-
-    # Phone extraction
-    phone_pattern = r'\+?\d[\d\s\-\(\)]{8,}\d'
-    phones = re.findall(phone_pattern, text)
-    contact_info['phone'] = phones[0] if phones else ""
-
-    return contact_info
-
+# Extract tech skills (basic example)
 def extract_skills(text: str) -> List[str]:
-    """Extract skills from text based on common skill keywords"""
-    # Common technical skills (can be expanded)
-    skill_patterns = [
-        # Programming languages
+    patterns = [
         r'\b(python|java|javascript|c\+\+|c#|php|ruby|go|swift|kotlin|scala|r)\b',
-        # Web technologies
         r'\b(html|css|react|angular|vue|node\.?js|express|django|flask|spring)\b',
-        # Databases
         r'\b(mysql|postgresql|mongodb|redis|elasticsearch|oracle|sql server)\b',
-        # Cloud platforms
         r'\b(aws|azure|gcp|google cloud|kubernetes|docker|terraform)\b',
-        # Data science
         r'\b(machine learning|deep learning|data science|pandas|numpy|tensorflow|pytorch)\b',
-        # Others
         r'\b(git|jenkins|agile|scrum|rest|api|microservices)\b'
     ]
-
+    text_low = text.lower()
     skills = set()
-    text_lower = text.lower()
-
-    for pattern in skill_patterns:
-        matches = re.findall(pattern, text_lower, re.IGNORECASE)
-        skills.update(matches)
-
+    for pat in patterns:
+        skills.update(re.findall(pat, text_low, re.I))
     return list(skills)
 
-# OpenAI embedding functions
+# Get embedding from OpenAI
 @st.cache_data
-def get_embedding(text: str, _client) -> Optional[List[float]]:
-    """Get embedding for text using OpenAI API"""
-    if not _client:
+def get_embedding(text: str, client) -> Optional[List[float]]:
+    if not client or not text.strip():
         return None
-
     try:
-        # Clean text
-        text = text.replace("\n", " ").strip()
-        if not text:
-            return None
-
-        response = _client.embeddings.create(
-            input=text,
-            model="text-embedding-3-small"
-        )
-        return response.data[0].embedding
+        resp = client.embeddings.create(input=text.replace("\n", " "), model="text-embedding-3-small")
+        return resp.data[0].embedding
     except Exception as e:
-        st.error(f"Error getting embedding: {str(e)}")
+        st.error(f"OpenAI embedding error: {str(e)}")
         return None
 
-def calculate_cosine_similarity(embedding1: List[float], embedding2: List[float]) -> float:
-    """Calculate cosine similarity between two embeddings"""
-    if not embedding1 or not embedding2:
+# Cosine similarity
+def cosine_sim(v1, v2) -> float:
+    if v1 is None or v2 is None:
         return 0.0
+    return float(cosine_similarity(np.array(v1).reshape(1, -1), np.array(v2).reshape(1, -1))[0][0])
 
-    # Convert to numpy arrays
-    vec1 = np.array(embedding1).reshape(1, -1)
-    vec2 = np.array(embedding2).reshape(1, -1)
-
-    # Calculate cosine similarity
-    similarity = cosine_similarity(vec1, vec2)[0][0]
-    return float(similarity)
-
-# Scoring functions
-def calculate_hard_match_score(resume_text: str, job_description: str) -> Dict:
-    """Calculate hard match score based on keyword overlap"""
-    resume_keywords = extract_keywords(resume_text, top_k=50)
-    jd_keywords = extract_keywords(job_description, top_k=50)
-
+# Hard match score calculation (keyword & skills overlap)
+def calculate_hard_match(resume_text: str, jd_text: str) -> Dict:
+    resume_keywords = extract_keywords(resume_text, 50)
+    jd_keywords = extract_keywords(jd_text, 50)
     resume_skills = extract_skills(resume_text)
-    jd_skills = extract_skills(job_description)
+    jd_skills = extract_skills(jd_text)
 
-    # Calculate keyword overlap
-    keyword_overlap = len(set(resume_keywords) & set(jd_keywords))
-    keyword_score = (keyword_overlap / max(len(jd_keywords), 1)) * 100
-
-    # Calculate skills overlap
-    skills_overlap = len(set(resume_skills) & set(jd_skills))
-    skills_score = (skills_overlap / max(len(jd_skills), 1)) * 100
-
-    # Missing skills
+    kw_overlap = len(set(resume_keywords) & set(jd_keywords))
+    kw_score = (kw_overlap / max(len(jd_keywords), 1)) * 100
+    skill_overlap = len(set(resume_skills) & set(jd_skills))
+    skill_score = (skill_overlap / max(len(jd_skills), 1)) * 100
     missing_skills = list(set(jd_skills) - set(resume_skills))
 
-    # Combined hard match score (weighted average)
-    hard_score = (keyword_score * 0.6 + skills_score * 0.4)
-
+    hard_score = (kw_score * 0.6 + skill_score * 0.4)
     return {
-        'score': min(hard_score, 100),
-        'keyword_overlap': keyword_overlap,
-        'skills_overlap': skills_overlap,
-        'missing_skills': missing_skills,
-        'resume_skills': resume_skills,
-        'jd_skills': jd_skills
+        "score": min(hard_score, 100),
+        "keyword_overlap": kw_overlap,
+        "skills_overlap": skill_overlap,
+        "missing_skills": missing_skills,
+        "resume_skills": resume_skills,
+        "jd_skills": jd_skills
     }
 
-def calculate_semantic_score(resume_embedding: List[float], jd_embedding: List[float]) -> float:
-    """Calculate semantic similarity score"""
-    if not resume_embedding or not jd_embedding:
-        return 0.0
+# Semantic score
+def calculate_semantic(resume_emb, jd_emb):
+    sim = cosine_sim(resume_emb, jd_emb)
+    return (sim + 1) / 2 * 100  # Normalize from [-1,1] to [0,100]
 
-    similarity = calculate_cosine_similarity(resume_embedding, jd_embedding)
-    # Convert to 0-100 scale
-    return (similarity + 1) / 2 * 100  # Normalize from [-1,1] to [0,100]
+# Final weighted score
+def final_score(hard_score, semantic_score, hard_w=0.4, semantic_w=0.6):
+    return min(hard_score * hard_w + semantic_score * semantic_w, 100)
 
-def calculate_final_score(hard_score: float, semantic_score: float, 
-                         hard_weight: float = 0.4, semantic_weight: float = 0.6) -> float:
-    """Calculate final weighted score"""
-    final_score = (hard_score * hard_weight) + (semantic_score * semantic_weight)
-    return min(final_score, 100)
-
-def get_verdict(score: float) -> str:
-    """Get verdict based on score"""
+# Verdict based on score
+def get_verdict(score):
     if score >= 75:
         return "High Suitability"
-    elif score >= 50:
+    elif score >=50:
         return "Medium Suitability"
     else:
         return "Low Suitability"
 
-def get_verdict_color(verdict: str) -> str:
-    """Get color for verdict display"""
+# Extract contact info
+def extract_contact(text: str) -> Dict:
+    contact = {}
+    emails = re.findall(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text)
+    phones = re.findall(r'\+?\d[\d\s\-\(\)]{8,}\d', text)
+    contact['email'] = emails[0] if emails else ""
+    contact['phone'] = phones[0] if phones else ""
+    return contact
+
+# Suggestions
+def generate_suggestions(hard_res, semantic_score):
+    suggestions = []
+    missing_skills = hard_res.get('missing_skills', [])
+    if missing_skills:
+        suggestions.append(f"Consider adding these missing skills: {', '.join(missing_skills[:5])}")
+    if hard_res['score'] < 50:
+        suggestions.append("Add more relevant keywords from the job description to your resume.")
+        suggestions.append("Highlight specific projects showing required skills.")
+    if semantic_score < 50:
+        suggestions.append("Restructure your resume to better align with job requirements.")
+        suggestions.append("Use more industry-specific terminology.")
+    if hard_res['skills_overlap'] < 3:
+        suggestions.append("Add more technical skills matching job needs.")
+    suggestions.append("Quantify your achievements with metrics/results.")
+    suggestions.append("Include relevant certifications or training.")
+    return suggestions
+
+# Evaluate a single resume
+def evaluate_resume(resume_text, jd_text, client):
+    resume_emb = get_embedding(resume_text, client)
+    jd_emb = get_embedding(jd_text, client)
+    hard_res = calculate_hard_match(resume_text, jd_text)
+    semantic_score = calculate_semantic(resume_emb, jd_emb)
+    final = final_score(hard_res['score'], semantic_score)
+    verdict = get_verdict(final)
+    contact_info = extract_contact(resume_text)
+    suggestions = generate_suggestions(hard_res, semantic_score)
+    return {
+        "final_score": final,
+        "hard_score": hard_res['score'],
+        "semantic_score": semantic_score,
+        "verdict": verdict,
+        "contact_info": contact_info,
+        "skills_analysis": {
+            "resume_skills": hard_res['resume_skills'],
+            "jd_skills": hard_res['jd_skills'],
+            "missing_skills": hard_res['missing_skills'],
+            "skills_overlap": hard_res['skills_overlap']
+        },
+        "suggestions": suggestions,
+        "timestamp": datetime.now().isoformat()
+    }
+
+def get_verdict_color(verdict):
     colors = {
         "High Suitability": "green",
         "Medium Suitability": "orange",
@@ -280,480 +228,218 @@ def get_verdict_color(verdict: str) -> str:
     }
     return colors.get(verdict, "gray")
 
-# Main evaluation function
-def evaluate_resume(resume_text: str, job_description: str, client) -> Dict:
-    """Main function to evaluate resume against job description"""
-
-    # Get embeddings
-    resume_embedding = get_embedding(resume_text, client)
-    jd_embedding = get_embedding(job_description, client)
-
-    # Calculate scores
-    hard_match_result = calculate_hard_match_score(resume_text, job_description)
-    semantic_score = calculate_semantic_score(resume_embedding, jd_embedding)
-
-    # Calculate final score
-    final_score = calculate_final_score(hard_match_result['score'], semantic_score)
-
-    # Get verdict
-    verdict = get_verdict(final_score)
-
-    # Extract contact info
-    contact_info = extract_contact_info(resume_text)
-
-    # Generate suggestions
-    suggestions = generate_suggestions(hard_match_result, semantic_score)
-
-    return {
-        'final_score': final_score,
-        'hard_score': hard_match_result['score'],
-        'semantic_score': semantic_score,
-        'verdict': verdict,
-        'contact_info': contact_info,
-        'skills_analysis': {
-            'resume_skills': hard_match_result['resume_skills'],
-            'jd_skills': hard_match_result['jd_skills'],
-            'missing_skills': hard_match_result['missing_skills'],
-            'skills_overlap': hard_match_result['skills_overlap']
-        },
-        'keyword_analysis': {
-            'keyword_overlap': hard_match_result['keyword_overlap']
-        },
-        'suggestions': suggestions,
-        'timestamp': datetime.now().isoformat()
-    }
-
-def generate_suggestions(hard_match_result: Dict, semantic_score: float) -> List[str]:
-    """Generate improvement suggestions"""
-    suggestions = []
-
-    missing_skills = hard_match_result.get('missing_skills', [])
-
-    if missing_skills:
-        suggestions.append(f"Consider adding these missing skills: {', '.join(missing_skills[:5])}")
-
-    if hard_match_result['score'] < 50:
-        suggestions.append("Add more relevant keywords from the job description to your resume")
-        suggestions.append("Highlight specific projects that demonstrate required skills")
-
-    if semantic_score < 50:
-        suggestions.append("Restructure your resume content to better align with job requirements")
-        suggestions.append("Use more industry-specific terminology and phrases")
-
-    if hard_match_result['skills_overlap'] < 3:
-        suggestions.append("Add more technical skills that match the job requirements")
-
-    suggestions.append("Quantify your achievements with specific metrics and results")
-    suggestions.append("Include relevant certifications or training programs")
-
-    return suggestions
-
-# Initialize session state
-def init_session_state():
-    """Initialize session state variables"""
-    if 'evaluations' not in st.session_state:
-        st.session_state.evaluations = []
-    if 'current_job_id' not in st.session_state:
-        st.session_state.current_job_id = None
-
-# Streamlit UI
+# Streamlit UI with enhanced theming and layout
 def main():
-    init_session_state()
+    st.set_page_config(
+        page_title="Automated Resume Relevance Check System",
+        page_icon="📄",
+        layout="wide"
+    )
+    # Custom CSS for professional look
+    custom_css = """
+    <style>
+    .block-container {
+        max-width: 1000px;
+        padding: 2rem 2rem 2rem 2rem;
+    }
+    .stButton>button {
+        background-color: #4B8BBE;
+        color: white;
+        font-weight: bold;
+        border-radius: 8px;
+        padding: 10px 20px;
+        border: none;
+        transition: background-color 0.3s ease;
+    }
+    .stButton>button:hover {
+        background-color: #306998;
+        color: white;
+    }
+    header .css-1v3fvcr {
+        background-color: #14213d !important;
+        color: white !important;
+    }
+    footer {
+        visibility: hidden;
+    }
+    </style>
+    """
+    st.markdown(custom_css, unsafe_allow_html=True)
 
     st.title("🎯 Automated Resume Relevance Check System")
-    st.markdown("**Innomatics Research Labs - AI-Powered Resume Evaluation**")
+    st.markdown("#### Innomatics Research Labs - AI Powered Resume Evaluation")
 
-    # Initialize OpenAI client
     client = init_openai_client()
-
     if not client:
-        st.stop()
+        return
 
-    # Sidebar for navigation
-    st.sidebar.title("Navigation")
-    page = st.sidebar.selectbox(
-        "Choose a page",
-        ["Resume Evaluation", "Dashboard", "Analytics"]
-    )
+    # Sidebar navigation
+    page = st.sidebar.selectbox("Navigate", ["Resume Evaluation", "Dashboard"])
+
+    # Session state init
+    if "evaluations" not in st.session_state:
+        st.session_state.evaluations = []
 
     if page == "Resume Evaluation":
-        show_evaluation_page(client)
-    elif page == "Dashboard":
-        show_dashboard_page()
-    else:
-        show_analytics_page()
+        st.header("📄 Resume Evaluation")
 
-def show_evaluation_page(client):
-    """Show the main evaluation page"""
-    st.header("📄 Resume Evaluation")
-
-    # Job description input
-    st.subheader("1. Job Description")
-    job_description = st.text_area(
-        "Paste the job description here:",
-        height=200,
-        placeholder="Paste the complete job description including required skills, qualifications, and responsibilities..."
-    )
-
-    # Job ID input
-    job_id = st.text_input(
-        "Job ID (optional):",
-        placeholder="e.g., JOB-2024-001"
-    )
-
-    # Resume upload
-    st.subheader("2. Resume Upload")
-    uploaded_files = st.file_uploader(
-        "Upload resume files (PDF or DOCX):",
-        type=['pdf', 'docx'],
-        accept_multiple_files=True,
-        help="You can upload multiple resumes for batch processing"
-    )
-
-    # Evaluation settings
-    st.subheader("3. Evaluation Settings")
-    col1, col2 = st.columns(2)
-
-    with col1:
-        hard_weight = st.slider(
-            "Hard Match Weight:",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.4,
-            step=0.1,
-            help="Weight for keyword and skill matching"
-        )
-
-    with col2:
-        semantic_weight = st.slider(
-            "Semantic Match Weight:",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.6,
-            step=0.1,
-            help="Weight for semantic similarity"
-        )
-
-    # Evaluate button
-    if st.button("🚀 Evaluate Resumes", type="primary"):
-        if not job_description.strip():
-            st.error("Please provide a job description")
-            return
-
-        if not uploaded_files:
-            st.error("Please upload at least one resume")
-            return
-
-        # Process each resume
-        progress_bar = st.progress(0)
-        results = []
-
-        for i, uploaded_file in enumerate(uploaded_files):
-            st.write(f"Processing: {uploaded_file.name}")
-
-            # Extract text
-            resume_text = extract_text_from_file(uploaded_file)
-
-            if resume_text:
-                # Evaluate resume
-                evaluation_result = evaluate_resume(resume_text, job_description, client)
-                evaluation_result['filename'] = uploaded_file.name
-                evaluation_result['job_id'] = job_id
-                evaluation_result['job_description'] = job_description[:200] + "..." if len(job_description) > 200 else job_description
-
-                results.append(evaluation_result)
-
-                # Store in session state
-                st.session_state.evaluations.append(evaluation_result)
-
-            progress_bar.progress((i + 1) / len(uploaded_files))
-
-        # Display results
-        st.success(f"Evaluated {len(results)} resumes successfully!")
-
-        # Show results table
-        display_results_table(results)
-
-        # Show detailed results
-        for result in results:
-            display_detailed_result(result)
-
-def display_results_table(results: List[Dict]):
-    """Display results in a table format"""
-    if not results:
-        return
-
-    st.subheader("📊 Evaluation Results Summary")
-
-    # Create DataFrame
-    df_data = []
-    for result in results:
-        df_data.append({
-            'Resume': result['filename'],
-            'Final Score': f"{result['final_score']:.1f}",
-            'Hard Match': f"{result['hard_score']:.1f}",
-            'Semantic Match': f"{result['semantic_score']:.1f}",
-            'Verdict': result['verdict'],
-            'Missing Skills': len(result['skills_analysis']['missing_skills']),
-            'Timestamp': result['timestamp'].split('T')[0]  # Just date
-        })
-
-    df = pd.DataFrame(df_data)
-
-    # Style the dataframe
-    def color_verdict(val):
-        color = get_verdict_color(val)
-        return f'background-color: {color}; color: white; font-weight: bold'
-
-    styled_df = df.style.applymap(color_verdict, subset=['Verdict'])
-    st.dataframe(styled_df, use_container_width=True)
-
-def display_detailed_result(result: Dict):
-    """Display detailed result for a single resume"""
-    st.subheader(f"📋 Detailed Analysis: {result['filename']}")
-
-    # Score overview
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric(
-            "Final Score",
-            f"{result['final_score']:.1f}/100",
-            delta=None
-        )
-
-    with col2:
-        st.metric(
-            "Hard Match",
-            f"{result['hard_score']:.1f}/100"
-        )
-
-    with col3:
-        st.metric(
-            "Semantic Match",
-            f"{result['semantic_score']:.1f}/100"
-        )
-
-    with col4:
-        verdict_color = get_verdict_color(result['verdict'])
-        st.markdown(f"**Verdict:** :{verdict_color}[{result['verdict']}]")
-
-    # Skills analysis
-    with st.expander("🛠️ Skills Analysis"):
-        skills_data = result['skills_analysis']
-
-        col1, col2 = st.columns(2)
-
+        # Job description input
+        col1, col2 = st.columns([3,1])
         with col1:
-            st.write("**Resume Skills:**")
-            if skills_data['resume_skills']:
-                for skill in skills_data['resume_skills']:
-                    st.write(f"• {skill}")
+            st.subheader("1. Job Description Input")
+            jd_textarea = st.text_area("Paste Job Description (Optional if uploading file):", height=180)
+            jd_file = st.file_uploader("Or Upload Job Description file (PDF/DOCX):", type=['pdf','docx'], help="Upload job description file in PDF or DOCX format")
+            job_desc_text = ""
+            if jd_file is not None:
+                job_desc_text = extract_text_from_file(jd_file)
+                if not job_desc_text:
+                    st.warning("Uploaded Job description file is empty or error extracting text")
+            elif jd_textarea.strip():
+                job_desc_text = jd_textarea.strip()
             else:
-                st.write("No technical skills identified")
+                st.warning("Please enter or upload a job description.")
+                st.stop()
 
         with col2:
-            st.write("**Required Skills:**")
-            if skills_data['jd_skills']:
-                for skill in skills_data['jd_skills']:
-                    if skill in skills_data['resume_skills']:
-                        st.write(f"✅ {skill}")
-                    else:
-                        st.write(f"❌ {skill}")
-            else:
-                st.write("No specific skills identified in job description")
+            st.subheader("Job ID (Optional)")
+            job_id = st.text_input("Enter Job ID:", placeholder="e.g. JOB-2025-001")
 
-    # Missing skills
-    if result['skills_analysis']['missing_skills']:
-        with st.expander("❗ Missing Skills"):
-            for skill in result['skills_analysis']['missing_skills']:
-                st.write(f"• {skill}")
+        # Resume upload
+        st.subheader("2. Upload Resumes (PDF or DOCX, multiple allowed)")
+        uploaded_resumes = st.file_uploader("Upload resume files:", type=['pdf','docx'], accept_multiple_files=True)
 
-    # Contact information
-    if any(result['contact_info'].values()):
-        with st.expander("📞 Contact Information"):
-            if result['contact_info']['email']:
-                st.write(f"**Email:** {result['contact_info']['email']}")
-            if result['contact_info']['phone']:
-                st.write(f"**Phone:** {result['contact_info']['phone']}")
+        st.subheader("3. Evaluation Settings")
+        hard_w = st.slider("Hard Match Weight (Keywords & Skills)", 0.0, 1.0, 0.4, 0.1)
+        semantic_w = st.slider("Semantic Match Weight (Embedding Similarity)", 0.0, 1.0, 0.6, 0.1)
 
-    # Suggestions
-    with st.expander("💡 Improvement Suggestions"):
-        for i, suggestion in enumerate(result['suggestions'], 1):
-            st.write(f"{i}. {suggestion}")
+        if st.button("🚀 Evaluate Resumes"):
+            if not uploaded_resumes:
+                st.error("Please upload at least one resume file")
+                return
+            if not job_desc_text.strip():
+                st.error("Job description is required")
+                return
+            st.info(f"Evaluating {len(uploaded_resumes)} resumes...")
 
-    st.divider()
+            progress_bar = st.progress(0)
+            results = []
 
-def show_dashboard_page():
-    """Show the dashboard page"""
-    st.header("📈 Results Dashboard")
+            for i, uf in enumerate(uploaded_resumes):
+                st.write(f"Processing {uf.name}...")
+                resume_text = extract_text_from_file(uf)
+                if not resume_text:
+                    st.warning(f"Could not extract text from {uf.name}")
+                    continue
+                res_eval = evaluate_resume(resume_text, job_desc_text, client)
+                res_eval['filename'] = uf.name
+                res_eval['job_id'] = job_id
+                results.append(res_eval)
+                st.session_state.evaluations.append(res_eval)
+                progress_bar.progress((i+1)/len(uploaded_resumes))
 
-    if not st.session_state.evaluations:
-        st.info("No evaluations yet. Go to the Resume Evaluation page to get started.")
-        return
+            st.success("Evaluation complete!")
 
-    # Summary statistics
-    evaluations = st.session_state.evaluations
+            if results:
+                # Show results table with color coded verdict
+                df_res = pd.DataFrame([{
+                    "Resume": r["filename"],
+                    "Final Score": round(r["final_score"],1),
+                    "Hard Match": round(r["hard_score"],1),
+                    "Semantic Match": round(r["semantic_score"],1),
+                    "Verdict": r["verdict"],
+                    "Missing Skills": len(r["skills_analysis"]["missing_skills"]),
+                    "Timestamp": r["timestamp"].split("T")[0]
+                } for r in results])
 
-    col1, col2, col3, col4 = st.columns(4)
+                def color_verdict(val):
+                    color = get_verdict_color(val)
+                    return f"background-color: {color}; color: white; font-weight: bold"
+                st.subheader("📊 Evaluation Summary")
+                st.dataframe(df_res.style.applymap(color_verdict, subset=["Verdict"]), use_container_width=True)
 
-    with col1:
-        st.metric("Total Evaluations", len(evaluations))
+                # Detailed per resume
+                for r in results:
+                    st.markdown(f"---\n### Detailed Analysis: {r['filename']}")
+                    st.metric("Final Relevance Score", f"{r['final_score']:.1f}/100")
+                    st.metric("Hard Match Score", f"{r['hard_score']:.1f}/100")
+                    st.metric("Semantic Match Score", f"{r['semantic_score']:.1f}/100")
+                    st.markdown(f"**Verdict:** <span style='color:{get_verdict_color(r['verdict'])}; font-weight:bold'>{r['verdict']}</span>", unsafe_allow_html=True)
+                    with st.expander("Skills Analysis"):
+                        st.write("Resume Skills:")
+                        if r['skills_analysis']['resume_skills']:
+                            for skill in r['skills_analysis']['resume_skills']:
+                                st.write(f"• {skill}")
+                        else:
+                            st.write("_No technical skills identified_")
+                        st.write("Required Skills:")
+                        if r['skills_analysis']['jd_skills']:
+                            for skill in r['skills_analysis']['jd_skills']:
+                                mark = "✅" if skill in r['skills_analysis']['resume_skills'] else "❌"
+                                st.write(f"{mark} {skill}")
+                        else:
+                            st.write("_No specific skills identified in job description_")
+                    with st.expander("Missing Skills"):
+                        if r['skills_analysis']['missing_skills']:
+                            for ms in r['skills_analysis']['missing_skills']:
+                                st.write(f"• {ms}")
+                        else:
+                            st.write("_No missing skills identified_")
+                    with st.expander("Contact Information"):
+                        email = r['contact_info'].get('email', '')
+                        phone = r['contact_info'].get('phone', '')
+                        if email: st.write(f"Email: {email}")
+                        if phone: st.write(f"Phone: {phone}")
+                        if not email and not phone:
+                            st.write("_No contact information found_")
+                    with st.expander("Improvement Suggestions"):
+                        for idx, sug in enumerate(r['suggestions'], 1):
+                            st.write(f"{idx}. {sug}")
 
-    with col2:
-        avg_score = np.mean([e['final_score'] for e in evaluations])
-        st.metric("Average Score", f"{avg_score:.1f}")
+    else:  # Dashboard
+        st.header("📈 Evaluation Dashboard")
+        if not st.session_state.evaluations:
+            st.info("No evaluations done yet. Go to the Resume Evaluation page to start.")
+            return
 
-    with col3:
-        high_suitable = len([e for e in evaluations if e['verdict'] == 'High Suitability'])
-        st.metric("High Suitability", high_suitable)
+        evaluations = st.session_state.evaluations
 
-    with col4:
-        recent_date = max([e['timestamp'].split('T')[0] for e in evaluations])
-        st.metric("Last Evaluation", recent_date)
+        # Filters
+        verdict_filter = st.selectbox("Filter by Suitability Verdict", ["All", "High Suitability", "Medium Suitability", "Low Suitability"])
+        min_score = st.slider("Minimum Final Score", 0, 100, 0)
+        job_ids = list(sorted(set(e.get("job_id") for e in evaluations if e.get("job_id"))))
+        job_filter = st.selectbox("Filter by Job ID", ["All"] + job_ids) if job_ids else None
 
-    # Filters
-    st.subheader("🔍 Filters")
-    col1, col2, col3 = st.columns(3)
+        filtered = evaluations
+        if verdict_filter != "All":
+            filtered = [e for e in filtered if e['verdict'] == verdict_filter]
+        filtered = [e for e in filtered if e['final_score'] >= min_score]
+        if job_filter and job_filter != "All":
+            filtered = [e for e in filtered if e.get('job_id') == job_filter]
 
-    with col1:
-        verdict_filter = st.selectbox(
-            "Filter by Verdict:",
-            ["All", "High Suitability", "Medium Suitability", "Low Suitability"]
-        )
+        if not filtered:
+            st.info("No results match the current filters.")
+            return
 
-    with col2:
-        min_score = st.number_input("Minimum Score:", min_value=0, max_value=100, value=0)
+        df = pd.DataFrame([{
+            "Resume": r["filename"],
+            "Job ID": r.get("job_id", ""),
+            "Final Score": round(r["final_score"],1),
+            "Hard Match": round(r["hard_score"],1),
+            "Semantic Match": round(r["semantic_score"],1),
+            "Verdict": r["verdict"],
+            "Missing Skills": len(r["skills_analysis"]["missing_skills"]),
+            "Timestamp": r["timestamp"].split("T")[0]
+        } for r in filtered])
 
-    with col3:
-        job_ids = list(set([e.get('job_id', 'Unknown') for e in evaluations if e.get('job_id')]))
-        if job_ids:
-            job_filter = st.selectbox("Filter by Job ID:", ["All"] + job_ids)
-        else:
-            job_filter = "All"
+        def color_verdict(val):
+            color = get_verdict_color(val)
+            return f"background-color: {color}; color: white; font-weight: bold"
 
-    # Apply filters
-    filtered_evaluations = evaluations.copy()
+        st.dataframe(df.style.applymap(color_verdict, subset=["Verdict"]), use_container_width=True)
 
-    if verdict_filter != "All":
-        filtered_evaluations = [e for e in filtered_evaluations if e['verdict'] == verdict_filter]
-
-    filtered_evaluations = [e for e in filtered_evaluations if e['final_score'] >= min_score]
-
-    if job_filter != "All":
-        filtered_evaluations = [e for e in filtered_evaluations if e.get('job_id') == job_filter]
-
-    # Results table
-    st.subheader(f"📊 Results ({len(filtered_evaluations)} items)")
-
-    if filtered_evaluations:
-        display_results_table(filtered_evaluations)
-
-        # Export functionality
-        if st.button("📥 Export Results to CSV"):
-            df_data = []
-            for result in filtered_evaluations:
-                df_data.append({
-                    'Filename': result['filename'],
-                    'Job_ID': result.get('job_id', ''),
-                    'Final_Score': result['final_score'],
-                    'Hard_Score': result['hard_score'],
-                    'Semantic_Score': result['semantic_score'],
-                    'Verdict': result['verdict'],
-                    'Email': result['contact_info'].get('email', ''),
-                    'Phone': result['contact_info'].get('phone', ''),
-                    'Resume_Skills': ', '.join(result['skills_analysis']['resume_skills']),
-                    'Missing_Skills': ', '.join(result['skills_analysis']['missing_skills']),
-                    'Timestamp': result['timestamp']
-                })
-
-            df = pd.DataFrame(df_data)
-            csv = df.to_csv(index=False)
-
-            st.download_button(
-                label="Download CSV",
-                data=csv,
-                file_name=f"resume_evaluations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-    else:
-        st.info("No results match the current filters.")
-
-def show_analytics_page():
-    """Show analytics page"""
-    st.header("📊 Analytics")
-
-    if not st.session_state.evaluations:
-        st.info("No data available for analytics. Evaluate some resumes first.")
-        return
-
-    evaluations = st.session_state.evaluations
-
-    # Score distribution
-    st.subheader("Score Distribution")
-    scores = [e['final_score'] for e in evaluations]
-
-    # Create score ranges
-    score_ranges = ['0-25', '26-50', '51-75', '76-100']
-    score_counts = [
-        len([s for s in scores if 0 <= s <= 25]),
-        len([s for s in scores if 26 <= s <= 50]),
-        len([s for s in scores if 51 <= s <= 75]),
-        len([s for s in scores if 76 <= s <= 100])
-    ]
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.bar_chart(dict(zip(score_ranges, score_counts)))
-
-    with col2:
-        verdict_counts = {}
-        for e in evaluations:
-            verdict = e['verdict']
-            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
-
-        st.bar_chart(verdict_counts)
-
-    # Skills analysis
-    st.subheader("Skills Analysis")
-
-    all_missing_skills = []
-    all_resume_skills = []
-
-    for e in evaluations:
-        all_missing_skills.extend(e['skills_analysis']['missing_skills'])
-        all_resume_skills.extend(e['skills_analysis']['resume_skills'])
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write("**Most Common Missing Skills:**")
-        if all_missing_skills:
-            missing_skills_counts = {}
-            for skill in all_missing_skills:
-                missing_skills_counts[skill] = missing_skills_counts.get(skill, 0) + 1
-
-            # Sort by frequency
-            sorted_missing = sorted(missing_skills_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            for skill, count in sorted_missing:
-                st.write(f"• {skill} ({count} times)")
-        else:
-            st.write("No missing skills data available")
-
-    with col2:
-        st.write("**Most Common Resume Skills:**")
-        if all_resume_skills:
-            resume_skills_counts = {}
-            for skill in all_resume_skills:
-                resume_skills_counts[skill] = resume_skills_counts.get(skill, 0) + 1
-
-            # Sort by frequency
-            sorted_resume = sorted(resume_skills_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            for skill, count in sorted_resume:
-                st.write(f"• {skill} ({count} times)")
-        else:
-            st.write("No resume skills data available")
+        if st.button("Export Filtered Results as CSV"):
+            csv_data = df.to_csv(index=False)
+            st.download_button(label="Download CSV", data=csv_data, file_name=f"resume_evaluations_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime='text/csv')
 
 if __name__ == "__main__":
     main()
