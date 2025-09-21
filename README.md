@@ -1,4 +1,4 @@
-AI Resume Relevance Checker
+🎯 AI Resume Relevance Checker
 An intelligent, scalable web application designed to automate the initial stages of resume screening. This tool leverages a powerful AI language model to analyze and rank multiple candidates against a single job description based on semantic relevance, not just keyword matching.
 Features
 * Batch Processing: Upload and analyze dozens of resumes simultaneously against one job description.
