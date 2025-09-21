@@ -7,12 +7,22 @@ import tempfile
 import os
 import json
 import logging
+import sys
 
-# Import our custom modules
-from database import DatabaseManager
-from resume_parser import ResumeParser
-from job_parser import JobDescriptionParser
-from matching_engine import MatchingEngine
+# Add current directory to Python path to resolve import issues
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.append(current_dir)
+
+# Import custom modules with error handling
+try:
+    from database import DatabaseManager
+    from resume_parser import ResumeParser
+    from job_parser import JobDescriptionParser
+    from matching_engine import MatchingEngine
+except ImportError as e:
+    st.error(f"Import Error: {e}")
+    st.error("Please make sure all Python files are in the same directory")
+    st.stop()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
